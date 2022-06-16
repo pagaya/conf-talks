@@ -5,7 +5,6 @@ import pyspark
 import re
 from typing import cast, Any, Callable, Iterable, List, Sequence, Union, Tuple
 
-
 import map_in_pandas.mappandas as mappandas
 
 
@@ -27,36 +26,35 @@ def _spark_type_to_dtype(spark_type: str) -> str:
     return type_to_dtype[spark_type.lower()]
 
 
-def _fill_zero(data: Sequence[Tuple[Any, ...]]) -> Sequence[Tuple[Any, ...]]:
-    return [tuple([0 if x is None else x for x in tup]) for tup in data]
+GIGA = 1024 ** 3
+TEST_DATA = [
+    (1, 10, 100.1234, 1000.123, 1 * GIGA, 0x7F, None, 11, 7, True),
+    (None, 20, 200.1234, math.nan, 2 * GIGA, 0x41, "Key1", None, 7, False),
+    (3, 30, None, None, 3 * GIGA, None, "Key1", 31, 7, True),
+    (None, 40, 400.1234, 4000.123, None,       -2, "Key2",   41, 7, False),
+]
+TEST_SCHEMA = """
+        i int, j int NOT NULL, 
+        x double, y float, k bigint,
+        b byte, s string,
+        `m.id` short, 
+        `special[0]/name.x` int,
+        pred boolean""".strip()
 
 
-def create_numeric_dataframe(spark: pyspark.sql.SparkSession, as_panda: bool = False
-                             ) -> Union[pyspark.sql.DataFrame, pd.DataFrame]:
-    giga = 1024 ** 3
-    data = [
-        (1,    10, 100.1234, 1000.123, 1 * giga, 0x7F, None,     11, 7, True),
-        (None, 20, 200.1234, math.nan, 2 * giga, 0x41, "Key1", None, 7, False),
-        (3,    30, None,     None,     3 * giga, None, "Key1",   31, 7, True),
-        (None, 40, 400.1234, 4000.123, None,       -2, "Key2",   41, 7, False),
-    ]
-    schema = """
-            i int, j int NOT NULL, 
-            x double, y float, k bigint,
-            b byte, s string,
-            m short, 
-            `special[0]/name.x` int,
-            pred boolean""".strip()
+def create_numeric_dataframe(spark: pyspark.sql.SparkSession) -> pyspark.sql.DataFrame:
+    return spark.createDataFrame(TEST_DATA, schema=TEST_SCHEMA)
 
-    schema_items = re.split(r"\s*,\s*", schema)
+
+def create_numeric_panda() -> pd.DataFrame:
+    schema_items = re.split(r"\s*,\s*", TEST_SCHEMA)
     column_names = [re.split(r"\s+", s)[0] for s in schema_items]
     spark_types = [re.split(r"\s+", s)[1] for s in schema_items]
     pandas_dtypes = [_spark_type_to_dtype(s) for s in spark_types]
-    if as_panda:
-        arr = np.array(_fill_zero(data), dtype=list(zip(column_names, pandas_dtypes)))
-        return pd.DataFrame(arr, columns=column_names)
-
-    return spark.createDataFrame(data, schema=schema)
+    # convert None to zero in data
+    data_zero = [tuple([0 if x is None else x for x in tup]) for tup in TEST_DATA]
+    arr = np.array(data_zero, dtype=list(zip(column_names, pandas_dtypes)))
+    return pd.DataFrame(arr, columns=column_names)
 
 
 def _create_spark_session_for_test() -> pyspark.sql.SparkSession:
@@ -97,26 +95,32 @@ def test_map_in_pandas_spark_bug() -> None:
 def test_arrow_issue() -> None:
     # we get pyarrow error similar to what is mentioned here:
     # https://stackoverflow.com/questions/65135416/pyspark-streaming-with-pandas-udf
-    # this would fail if the pd_post function returned by pre_post_processing was not used.
+    # We handle this bug in  the pd_post function returned by pre_post_processing.
     df = create_numeric_dataframe(spark)
-    # if dtype= below is given as 'object' the pyarrow bug would not happen.
-    func = lambda pd_df: pd.DataFrame([pd_df.s.astype(str).max()], columns=["max_s"], dtype="string")
-    max_str_df = mappandas.map_in_pandas(spark, df, func, group_by=["s"])
+    df = df.drop('special[0]/name.x')  # avoid another bug we are handling in test_map_in_pandas_spark_bug
+    df = df.drop('m.id')
+    # if dtype= is given as 'object' the pyarrow bug does not happen.
+    func = lambda pd_df: pd.DataFrame([pd_df.s.astype(str).max()], columns=["max_s"], dtype="object")
+    max_str_df = mappandas._grouped_pandas(spark, df, ["s"], func)
     assert max_str_df.toPandas().max_s.to_list() == ["None", "Key1", "Key2"]
-
-    func_bad = lambda pd_df: pd.DataFrame([pd_df.s.astype(str).max()], columns=["max_s"], dtype="object")
-    max_str_df = mappandas.map_in_pandas(spark, df, func_bad, group_by=["s"])
-
-    assert max_str_df.toPandas().max_s.to_list() == ["None", "Key1", "Key2"]
+    # if function returns a string - there is a pyarrow exception - this is what we handle in the code
+    func_bad = lambda pd_df: pd.DataFrame([pd_df.s.astype(str).max()], columns=["max_s"], dtype="string")
+    max_str_df = mappandas._grouped_pandas(spark, df, ["s"], func_bad)
+    try:
+        assert max_str_df.toPandas().max_s.to_list() == ["None", "Key1", "Key2"]
+        ok = False  # we expect an exception because of pyarrow bug
+    except:
+        ok = True
+    assert ok
 
 
 def test_pandas_to_spark_schema() -> None:
-    df = create_numeric_dataframe(spark, as_panda=True)
+    df = create_numeric_panda()
     schema = mappandas._pandas_to_spark_schema(df)
     assert (
         schema.lower() == "i INT, j INT, "
         "x DOUBLE, y FLOAT, k BIGINT, b TINYINT, s STRING, "
-        "m SHORTINT, `special[0]/name.x` int, pred boolean".lower()
+        "`m.id` SHORTINT, `special[0]/name.x` int, pred boolean".lower()
     )
 
 
@@ -134,6 +138,10 @@ def test_map_in_pandas() -> None:
         df, lambda pd_df: pd.DataFrame([pd_df["special[0]/name.x"].sum()], columns=["sum_dot"])
     )
     assert sum_df3.toPandas().sum_dot.sum() == 7 * 4
+    sum_df4 = mappandas.map_in_pandas(spark,
+        df, lambda pd_df: pd.DataFrame([pd_df["m.id"].sum()], columns=["m.id"])
+    )
+    assert sum_df4.toPandas()["m.id"].sum() == 11 + 31 + 41
     max_str_df = mappandas.map_in_pandas(spark,
                                          df, lambda pd_df: pd.DataFrame([pd_df.s.astype(str).max()], columns=["max_s"]))
     assert max_str_df.toPandas().max_s.min() == "Key1"

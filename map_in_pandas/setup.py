@@ -10,4 +10,5 @@ setup(
     author_email="tal.franji@pagaya.com",
     description="Easy python wrapper for Spark mapInPandas, applyInPandas",
     package_data={"doc": ["*.ipynb"]},
+    keywords='spark pyspark',
 )

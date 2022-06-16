@@ -21,7 +21,9 @@ PD_FUNC = Callable[[pyspark.sql.DataFrame], pyspark.sql.DataFrame]
 
 
 def _wrap_field(field_name: str) -> str:
-    if re.search(r"\W", field_name):
+    if field_name.startswith("`"):
+        return field_name  # assume already wrapped
+    if re.search(r"[\W\.]", field_name):
         return f"`{field_name}`"
     return field_name
 
@@ -70,7 +72,7 @@ def _pd_field_name(field: Any) -> str:
 def _pandas_to_spark_schema(pd_df: pd.DataFrame) -> str:
     # TODO(franji): is this better than creating a Spark-DF from the panda and taking the schema?
     pd_schema = pd_df.dtypes
-    fields = [_pd_field_name(name) + " " + _pd_type_to_spark(pd_type.name) for name, pd_type in pd_schema.items()]
+    fields = [_wrap_field(_pd_field_name(name)) + " " + _pd_type_to_spark(pd_type.name) for name, pd_type in pd_schema.items()]
     return ", ".join(fields)
 
 
