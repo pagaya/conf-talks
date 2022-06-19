@@ -174,4 +174,5 @@ def test_map_in_pandas_grouped() -> None:
 
     group_df = mappandas.map_in_pandas(spark, df, _sum_dot, group_by=["s"])
     group_pd_df = group_df.toPandas()
+    assert len(group_pd_df) == 3
     assert group_pd_df[group_pd_df.s == "Key1"].iloc[0].sum_dot == 14
